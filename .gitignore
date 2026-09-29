@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data & output (nicht ins Repo)
+img/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
