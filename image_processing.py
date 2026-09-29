@@ -8,6 +8,7 @@ Autor: Yannik Kasprzak, Institut für Physik, Universität zu Lübeck
 """
 
 import os
+from datetime import datetime
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -58,6 +59,26 @@ def unique_output_path(directory: str, filename: str) -> str:
         path = os.path.join(directory, f"{base}_{counter}{ext}")
         counter += 1
     return path
+
+
+def timestamped_filename(base_name: str, ext: str) -> str:
+    """Baut einen Dateinamen mit Datums-/Uhrzeit-Suffix.
+
+    Format: "<base_name>_Tag_Monat_Jahr_Uhrzeit.<ext>", z. B.
+    "schichtdicke_plot_07_09_2026_14-30-22.png".
+
+    Parameters
+    ----------
+    base_name : str  Basisname ohne Endung
+    ext       : str  Dateiendung, mit oder ohne führenden Punkt
+
+    Returns
+    -------
+    str  Dateiname inkl. Zeitstempel und Endung.
+    """
+    ts = datetime.now().strftime("%d_%m_%Y_%H-%M-%S")
+    ext = ext.lstrip(".")
+    return f"{base_name}_{ts}.{ext}"
 
 
 # ── Kanal-Hilfsfunktion ───────────────────────────────────────────────────────
@@ -305,3 +326,66 @@ def find_spots(img: np.ndarray, threshold_fraction: float) -> np.ndarray:
 def count_spots(img: np.ndarray, threshold_fraction: float) -> int:
     """Zählt lokale Maxima als Spots — delegiert an find_spots."""
     return len(find_spots(img, threshold_fraction))
+
+
+# ── .img-Dateien einzeln laden (außerhalb der Hauptdatensatzliste) ────────────
+
+def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
+    """Lädt eine einzelne .img-Datei unabhängig von den im Hauptfenster bereits
+    geladenen Datensätzen (z. B. für Werkzeuge, die einen ganzen Ordner selbst
+    durchsuchen, wie die Z-Stack-Analyse).
+
+    Versucht zuerst photon_tools (loader="scanbin_s4"), fällt sonst auf den
+    byteweisen scanbin_s4-Fallback-Parser zurück (siehe
+    ImageViewer.open_custom_img für die identische Formatbeschreibung).
+
+    Returns
+    -------
+    dict mit "path", "name", "detector0", "detector1", "sum" (alle 2D-float32-
+    Arrays), oder None wenn die Datei nicht lesbar ist.
+    """
+    try:
+        import photon_tools as _pt
+    except Exception:
+        _pt = None
+
+    if _pt is not None:
+        try:
+            ds = _pt.load_image(path, loader=loader_name)
+            det0 = np.asarray(ds.channels["detector0"], dtype=np.float32)
+            det1 = np.asarray(ds.channels["detector1"], dtype=np.float32)
+            return {"path": path, "name": os.path.basename(path),
+                    "detector0": det0, "detector1": det1, "sum": det0 + det1}
+        except Exception:
+            pass
+
+    try:
+        with open(path, "rb") as fobj:
+            data = fobj.read()
+        if len(data) <= 88:
+            return None
+
+        header = data[:88]
+        payload = data[88:]
+        width = int.from_bytes(header[24:28], byteorder="big", signed=False)
+        height = int.from_bytes(header[28:32], byteorder="big", signed=False)
+        if width <= 0 or height <= 0:
+            return None
+
+        raw_u16 = np.frombuffer(payload, dtype=">u2")
+        pixels_per_frame = width * height
+        total_values = (len(raw_u16) // pixels_per_frame) * pixels_per_frame
+        if total_values == 0:
+            return None
+
+        n_frames = total_values // pixels_per_frame
+        frames = raw_u16[:total_values].reshape(n_frames, height, width).astype(np.float32)
+        det0_frames = frames[0::2]
+        det1_frames = frames[1::2]
+        detector0 = det0_frames.sum(axis=0) if det0_frames.size else np.zeros((height, width), dtype=np.float32)
+        detector1 = det1_frames.sum(axis=0) if det1_frames.size else np.zeros((height, width), dtype=np.float32)
+        return {"path": path, "name": os.path.basename(path),
+                "detector0": detector0, "detector1": detector1,
+                "sum": detector0 + detector1}
+    except Exception:
+        return None

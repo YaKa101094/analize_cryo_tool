@@ -15,6 +15,8 @@ Modulstruktur
   analysis_schichtdicke.py – SchichtdickeDialog (Spot-Zählmethode)
   analysis_ics.py        – ICSDialog (Image Correlation Spectroscopy)
   ics_thickness.py        – Eigenständige, strenge ICS-Pipeline (CLI + Bibliothek)
+  analysis_spot_zaehler.py – SpotZaehlerDialog (Multi-Molekül-Spot-Zähler,
+                             portiert aus Spot_Zaehler_v7_patched.ipynb)
 
 Autor: Yannik Kasprzak, Institut für Physik, Universität zu Lübeck
 """

@@ -26,7 +26,7 @@ from tkinter import filedialog, ttk
 
 import numpy as np
 
-from image_processing import unique_output_path
+from image_processing import timestamped_filename, unique_output_path
 
 # ── Optionale Abhängigkeiten ──────────────────────────────────────────────────
 
@@ -498,6 +498,7 @@ class TimeraceDialog:
         if self._plot["fig"] is None:
             return
         output_dir = self._get_output_dir()
-        out_path = unique_output_path(output_dir, "fcs_plot.png")
+        out_path = unique_output_path(
+            output_dir, timestamped_filename("fcs_plot", "png"))
         self._plot["fig"].savefig(out_path, dpi=150, bbox_inches="tight",
                                   facecolor=self._plot["fig"].get_facecolor())

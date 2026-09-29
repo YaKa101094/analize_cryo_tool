@@ -17,7 +17,8 @@ from tkinter import ttk
 
 import numpy as np
 
-from image_processing import count_spots, get_channel_array, unique_output_path
+from image_processing import (count_spots, get_channel_array,
+                               timestamped_filename, unique_output_path)
 
 try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -319,7 +320,8 @@ class SchichtdickeDialog:
         if self._plot["fig"] is None:
             return
         output_dir = self._get_output_dir()
-        out_path = unique_output_path(output_dir, "schichtdicke_plot.png")
+        out_path = unique_output_path(
+            output_dir, timestamped_filename("schichtdicke_plot", "png"))
         self._plot["fig"].savefig(out_path, dpi=150, bbox_inches="tight",
                                   facecolor=self._plot["fig"].get_facecolor())
 

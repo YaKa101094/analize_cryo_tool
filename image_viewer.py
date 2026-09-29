@@ -24,6 +24,10 @@ import image_processing as _ip
 from analysis_timetrace import TimeraceDialog
 from analysis_schichtdicke import SchichtdickeDialog
 from analysis_ics import ICSDialog
+from analysis_spot_zaehler import SpotZaehlerDialog
+from analysis_krueger_ics import KruegerICSDialog
+from analysis_krueger_simulation import SpotSimulationDialog
+from analysis_krueger_zstack import ZStackDialog
 
 # ── Optionale Abhängigkeiten ──────────────────────────────────────────────────
 
@@ -44,6 +48,28 @@ def _natural_sort_key(s):
     """Sortierschlüssel für "natürliche" Reihenfolge (1, 2, ..., 10 statt 1, 10, 2)."""
     return [int(t) if t.isdigit() else t.lower()
             for t in re.split(r"(\d+)", s)]
+
+
+# Methoden im Tab "Analyse-Krüger" — alle in C:\Users\yanni\Desktop\Software Willi
+# als eigenständige Jupyter-Notebooks entwickelt (Wilhelm Krüger), hier als
+# auswählbare Untermenü-Punkte innerhalb eines gemeinsamen Tabs zusammengefasst
+# (siehe ImageViewer._rebuild_krueger_tab).
+KRUEGER_METHODS = [
+    ("Spot-Zähler (Methode A)", "spot_zaehler"),
+    ("ICS-Auswertung (Methode B)", "ics"),
+    ("Spot-Simulation", "simulation"),
+    ("Z-Stack (PSF)", "zstack"),
+]
+
+# Methoden im Tab "Analyse-Kasprzak" — die ursprünglichen, eigenständigen
+# Analyse-Tabs (Timetrace/FCS, Schichtdicke Zählen/ICS), nach demselben
+# Methodenauswahl-Prinzip wie Analyse-Krüger zusammengefasst (siehe
+# ImageViewer._rebuild_kasprzak_tab).
+KASPRZAK_METHODS = [
+    ("Timetrace / FCS", "timetrace"),
+    ("Schichtdicke (Zählen)", "schichtdicke"),
+    ("Schichtdicke (ICS)", "ics"),
+]
 
 
 class ImageViewer:
@@ -91,6 +117,7 @@ class ImageViewer:
         self.show_spots_var   = tk.BooleanVar(value=False)
         self.bg_correction_var = tk.BooleanVar(value=False)
         self.save_names_var   = tk.BooleanVar(value=True)
+        self.grid_filenames_var = tk.BooleanVar(value=False)
 
         self._photo_refs       = []     # GC-Schutz für PhotoImage-Objekte
         self._img_loader_name  = "scanbin_s4"
@@ -140,9 +167,9 @@ class ImageViewer:
 
         # ── Haupt-Notebook ────────────────────────────────────────────────────
         # "Bildanalyse" ist ein fester, nicht schließbarer erster Tab. Die
-        # übrigen Analyse-Werkzeuge (Timetrace, Schichtdicke) sind von Anfang
-        # an als weitere, schließbare Tabs vorhanden (siehe _build_tool_tabs) -
-        # kein separates Menü zum Öffnen mehr nötig.
+        # übrigen Analyse-Werkzeuge sind von Anfang an als weitere, schließbare
+        # Tabs mit Methodenauswahl vorhanden (Analyse-Kasprzak, Analyse-Krüger
+        # — siehe _build_tool_tabs) - kein separates Menü zum Öffnen mehr nötig.
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
 
@@ -254,7 +281,9 @@ class ImageViewer:
         tk.Checkbutton(frm_save, text="Namen mitspeichern",
                        variable=self.save_names_var).pack(anchor="w")
         tk.Checkbutton(frm_save, text="Rasterbild",
-                       variable=self.save_raster_var).pack(anchor="w", pady=(0, 6))
+                       variable=self.save_raster_var).pack(anchor="w")
+        tk.Checkbutton(frm_save, text="   Dateinamen statt Nummern",
+                       variable=self.grid_filenames_var).pack(anchor="w", pady=(0, 6))
         tk.Button(frm_save, text="Bilder speichern",
                   command=self.save_images_png).pack(fill="x", pady=(0, 6))
         tk.Button(frm_save, text="Output öffnen",
@@ -358,14 +387,14 @@ class ImageViewer:
         self._maybe_refresh_dataset_tabs()
 
     def _maybe_refresh_dataset_tabs(self):
-        """Aktualisiert die Schichtdicke-Tabs, falls sie bereits existieren.
+        """Aktualisiert die Methodenauswahl-Tabs, falls sie bereits existieren.
 
         Verhindert einen doppelten Aufbau beim allerersten Start: Dort ruft
         __init__ load_images() VOR _build_tool_tabs() auf, das den initialen
         Aufbau übernimmt. Bei jedem späteren Neuladen (z. B. "Bilder laden")
         existieren die Tabs schon und werden hier aktualisiert.
         """
-        if hasattr(self, "_schichtdicke_frame"):
+        if hasattr(self, "_kasprzak_frame"):
             self._refresh_dataset_tabs()
 
     def _set_empty_state(self, message: str):
@@ -888,7 +917,8 @@ class ImageViewer:
             safe_name = "".join(
                 c if c.isalnum() or c in "._- " else "_" for c in state["title_text"]
             ).strip()
-            out.save(_ip.unique_output_path(output_dir, f"{safe_name}.png"))
+            out.save(_ip.unique_output_path(
+                output_dir, _ip.timestamped_filename(safe_name, "png")))
             orig_title = win.title()
             win.title(f"{state['title_text']} — gespeichert!")
             win.after(2000, lambda: win.title(orig_title))
@@ -1181,6 +1211,34 @@ class ImageViewer:
         else:
             subprocess.run(["xdg-open", output_dir])
 
+    @staticmethod
+    def _fit_label_font(text, avail_w, measure_draw, max_size=13, min_size=7):
+        """Größte Schriftgröße (zwischen min_size und max_size), bei der
+        *text* in avail_w Pixel Breite passt; kürzt mit "…", falls *text*
+        selbst bei min_size noch zu breit für avail_w ist."""
+        def width(s, f):
+            try:
+                return measure_draw.textlength(s, font=f)
+            except AttributeError:
+                return f.getsize(s)[0]
+
+        font = ImageFont.load_default()
+        for size in range(max_size, min_size - 1, -1):
+            try:
+                f = ImageFont.truetype("arial.ttf", size)
+            except Exception:
+                break
+            font = f
+            if width(text, f) <= avail_w:
+                return font, text
+
+        truncated = text
+        while len(truncated) > 1 and width(truncated + "…", font) > avail_w:
+            truncated = truncated[:-1]
+        if truncated != text:
+            truncated += "…"
+        return font, truncated
+
     def save_images_png(self):
         """Exportiert Einzel-PNGs oder ein Grid-Übersichtsbild (je nach Checkbox)."""
         if not self.datasets:
@@ -1209,27 +1267,15 @@ class ImageViewer:
 
                 out = Image.new("RGB", (OUT_SIZE, OUT_SIZE), (26, 26, 26))
                 if include_name:
-                    # Schriftgröße anpassen, bis der Dateiname passt (mind. 7 pt)
-                    avail_w = img_w - 8
-                    fnt_title = ImageFont.load_default()
-                    for size in range(13, 6, -1):
-                        try:
-                            f = ImageFont.truetype("arial.ttf", size)
-                        except Exception:
-                            break
-                        try:
-                            tw = _measure_draw.textlength(dataset["name"], font=f)
-                        except AttributeError:
-                            tw = f.getsize(dataset["name"])[0]
-                        fnt_title = f
-                        if tw <= avail_w:
-                            break
-                    ImageDraw.Draw(out).text((4, 4), dataset["name"],
+                    fnt_title, label = self._fit_label_font(
+                        dataset["name"], img_w - 8, _measure_draw)
+                    ImageDraw.Draw(out).text((4, 4), label,
                                              fill=(255, 255, 200), font=fnt_title)
                 out.paste(color_img, (0, img_y))
                 out.paste(cbar, (img_w, img_y - lbl_h))
                 name = os.path.splitext(dataset["name"])[0]
-                out.save(_ip.unique_output_path(output_dir, f"{name}.png"))
+                out.save(_ip.unique_output_path(
+                    output_dir, _ip.timestamped_filename(name, "png")))
             self.status_label.config(
                 text=f"{len(active)} Einzelbild(er) (640x640) gespeichert in output/")
 
@@ -1246,6 +1292,7 @@ class ImageViewer:
         rows = math.ceil(n / cols)
 
         include_name = self.save_names_var.get()
+        use_filenames = self.grid_filenames_var.get()
         thumb_w, thumb_h = 220, 220
         label_h = 22 if include_name else 0
         cbar_w  = 40    # Breite der Farbleiste inkl. Platz für Labels oben/unten
@@ -1269,7 +1316,12 @@ class ImageViewer:
             y = pad + row * (thumb_h + label_h + pad)
 
             if include_name:
-                draw.text((x, y), f"{i + 1:03d}", fill=(255, 255, 200), font=font)
+                if use_filenames:
+                    label_font, label_text = self._fit_label_font(
+                        dataset["name"], thumb_w - 4, draw, max_size=14, min_size=7)
+                else:
+                    label_font, label_text = font, f"{i + 1:03d}"
+                draw.text((x, y), label_text, fill=(255, 255, 200), font=label_font)
             img_array = self._get_channel_image(dataset, "sum")
             thumb = self._to_color_image(img_array).resize(
                 (thumb_w, thumb_h), Image.Resampling.LANCZOS)
@@ -1279,7 +1331,8 @@ class ImageViewer:
             cbar = _ip.make_colorbar_pil(disp_min, disp_max, thumb_h)
             grid_img.paste(cbar, (x + thumb_w, y + label_h - lbl_h))
 
-        grid_img.save(_ip.unique_output_path(output_dir, "grid_overview.png"))
+        grid_img.save(_ip.unique_output_path(
+            output_dir, _ip.timestamped_filename("grid_overview", "png")))
 
     # ── Analyse-Dialoge ───────────────────────────────────────────────────────
 
@@ -1315,19 +1368,14 @@ class ImageViewer:
         """Erstellt die festen Analyse-Tabs neben "Bildanalyse" — alle direkt
         beim Start vorhanden, kein manuelles Öffnen über ein Menü mehr nötig.
 
-        Timetrace ist datensatzunabhängig (arbeitet auf eigenen HDF5-Dateien)
-        und wird daher nur einmal gebaut. Die beiden Schichtdicke-Tabs hängen
-        von self.datasets ab und werden über _refresh_dataset_tabs erzeugt,
-        das auch nach jedem Neuladen von Bildern erneut aufgerufen wird.
+        Analyse-Kasprzak und Analyse-Krüger werden über _refresh_dataset_tabs
+        erzeugt, das auch nach jedem Neuladen von Bildern erneut aufgerufen
+        wird (siehe dort).
         """
-        frame, close_tab = self._new_tab("Timetrace / FCS")
-        TimeraceDialog(frame, self._get_output_dir, on_close=close_tab)
-        self._timetrace_frame = frame
-
         self._refresh_dataset_tabs()
 
     def _refresh_dataset_tabs(self):
-        """Baut die datensatzabhängigen Tool-Tabs (Schichtdicke Zählen/ICS)
+        """Baut die Methodenauswahl-Tabs (Analyse-Kasprzak, Analyse-Krüger)
         neu auf, damit sie den aktuellen Datenstand zeigen.
 
         Wird einmal beim Start (aus _build_tool_tabs) und danach jedes Mal
@@ -1335,19 +1383,29 @@ class ImageViewer:
         """
         current = self.notebook.select()
 
-        self._rebuild_schichtdicke_tab()
-        self._rebuild_ics_tab()
+        self._rebuild_kasprzak_tab()
+        self._rebuild_krueger_tab()
 
-        # Falls vor dem Neuaufbau ein unbeteiligter Tab (z. B. "Bildanalyse"
-        # oder "Timetrace") aktiv war, den Fokus dort belassen statt auf den
-        # zuletzt neu gebauten Tab zu springen.
+        # Falls vor dem Neuaufbau ein unbeteiligter Tab (z. B. "Bildanalyse")
+        # aktiv war, den Fokus dort belassen statt auf den zuletzt neu
+        # gebauten Tab zu springen.
         if current and current in self.notebook.tabs():
             self.notebook.select(current)
 
-    def _rebuild_schichtdicke_tab(self):
-        """Baut den Tab "Schichtdicke (Zählen)" neu auf (löscht einen ggf.
-        bestehenden vorherigen Tab zuerst)."""
-        old_frame = getattr(self, "_schichtdicke_frame", None)
+    def _rebuild_kasprzak_tab(self):
+        """Baut den Tab "Analyse-Kasprzak" neu auf (löscht einen ggf.
+        bestehenden vorherigen Tab zuerst).
+
+        Fasst die früher eigenständigen Tabs Timetrace/FCS, Schichtdicke
+        (Zählen) und Schichtdicke (ICS) über eine Methodenauswahl zusammen —
+        Aufbau analog zu _rebuild_krueger_tab. Die Auswahl bleibt über ein
+        erneutes Laden von Bildern hinweg erhalten; der komplette Tab baut
+        sich dabei aber neu auf (Timetrace-Zwischenstand geht dabei wie
+        gehabt verloren, da Timetrace ohnehin unabhängig von den geladenen
+        Bilddatensätzen arbeitet)."""
+        old_frame = getattr(self, "_kasprzak_frame", None)
+        previous_method = getattr(self, "_kasprzak_method_var", None)
+        selected_label = previous_method.get() if previous_method is not None else KASPRZAK_METHODS[0][0]
         if old_frame is not None:
             try:
                 self.notebook.forget(old_frame)
@@ -1355,21 +1413,67 @@ class ImageViewer:
                 pass
             old_frame.destroy()
 
-        active = self._active_datasets()
-        active_idx = min(self.current_index, len(active) - 1) if active else 0
-        frame, close_tab = self._new_tab("Schichtdicke (Zählen)")
-        SchichtdickeDialog(
-            frame, active, active_idx,
-            lambda: self.threshold_value, self._get_output_dir,
-            lambda: self.bg_correction_var.get(),
-            on_close=close_tab,
-        )
-        self._schichtdicke_frame = frame
+        frame, close_tab = self._new_tab("Analyse-Kasprzak")
+        self._kasprzak_frame = frame
+        self._kasprzak_close_tab = close_tab
 
-    def _rebuild_ics_tab(self):
-        """Baut den Tab "Schichtdicke (ICS)" neu auf (löscht einen ggf.
-        bestehenden vorherigen Tab zuerst)."""
-        old_frame = getattr(self, "_ics_frame", None)
+        selector_frame = tk.Frame(frame)
+        selector_frame.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(selector_frame, text="Methode:", font=("Arial", 10, "bold")).pack(
+            side="left", padx=(0, 6))
+        self._kasprzak_method_var = tk.StringVar(value=selected_label)
+        method_combo = ttk.Combobox(
+            selector_frame, textvariable=self._kasprzak_method_var, state="readonly",
+            width=32, values=[label for label, _ in KASPRZAK_METHODS])
+        method_combo.pack(side="left")
+        method_combo.bind("<<ComboboxSelected>>", lambda _e: self._build_kasprzak_method_content())
+
+        self._kasprzak_content_frame = tk.Frame(frame)
+        self._kasprzak_content_frame.pack(fill="both", expand=True)
+
+        self._build_kasprzak_method_content()
+
+    def _build_kasprzak_method_content(self):
+        """Baut den Inhalt des Analyse-Kasprzak-Tabs für die aktuell in der
+        Methodenauswahl gewählte Methode neu auf."""
+        for widget in self._kasprzak_content_frame.winfo_children():
+            widget.destroy()
+
+        method_key = dict(KASPRZAK_METHODS).get(
+            self._kasprzak_method_var.get(), KASPRZAK_METHODS[0][1])
+        close_cmd = self._kasprzak_close_tab
+        content = self._kasprzak_content_frame
+
+        if method_key == "timetrace":
+            TimeraceDialog(content, self._get_output_dir, on_close=close_cmd)
+        elif method_key == "schichtdicke":
+            active = self._active_datasets()
+            active_idx = min(self.current_index, len(active) - 1) if active else 0
+            SchichtdickeDialog(
+                content, active, active_idx,
+                lambda: self.threshold_value, self._get_output_dir,
+                lambda: self.bg_correction_var.get(),
+                on_close=close_cmd,
+            )
+        elif method_key == "ics":
+            ICSDialog(content, self._active_datasets(), self._get_output_dir,
+                      lambda: self.bg_correction_var.get(), on_close=close_cmd)
+
+    def _rebuild_krueger_tab(self):
+        """Baut den Tab "Analyse-Krüger" neu auf (löscht einen ggf. bestehenden
+        vorherigen Tab zuerst).
+
+        Der Tab enthält oben eine Methodenauswahl (siehe KRUEGER_METHODS) und
+        darunter den Dialog der jeweils gewählten Methode. Die Auswahl bleibt
+        über ein erneutes Laden von Bildern hinweg erhalten (wie bei den
+        anderen Schichtdicke-Tabs baut sich aber auch hier der komplette Tab
+        bei jedem Neuladen neu auf, damit datensatzabhängige Methoden den
+        aktuellen Stand zeigen — Simulation/Z-Stack-Zwischenstände gehen dabei
+        mit verloren, das betrifft aber ohnehin nur die anderen beiden
+        Methoden nicht)."""
+        old_frame = getattr(self, "_krueger_frame", None)
+        previous_method = getattr(self, "_krueger_method_var", None)
+        selected_label = previous_method.get() if previous_method is not None else KRUEGER_METHODS[0][0]
         if old_frame is not None:
             try:
                 self.notebook.forget(old_frame)
@@ -1377,10 +1481,47 @@ class ImageViewer:
                 pass
             old_frame.destroy()
 
-        frame, close_tab = self._new_tab("Schichtdicke (ICS)")
-        ICSDialog(frame, self._active_datasets(), self._get_output_dir,
-                  lambda: self.bg_correction_var.get(), on_close=close_tab)
-        self._ics_frame = frame
+        frame, close_tab = self._new_tab("Analyse-Krüger")
+        self._krueger_frame = frame
+        self._krueger_close_tab = close_tab
+
+        selector_frame = tk.Frame(frame)
+        selector_frame.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(selector_frame, text="Methode:", font=("Arial", 10, "bold")).pack(
+            side="left", padx=(0, 6))
+        self._krueger_method_var = tk.StringVar(value=selected_label)
+        method_combo = ttk.Combobox(
+            selector_frame, textvariable=self._krueger_method_var, state="readonly",
+            width=32, values=[label for label, _ in KRUEGER_METHODS])
+        method_combo.pack(side="left")
+        method_combo.bind("<<ComboboxSelected>>", lambda _e: self._build_krueger_method_content())
+
+        self._krueger_content_frame = tk.Frame(frame)
+        self._krueger_content_frame.pack(fill="both", expand=True)
+
+        self._build_krueger_method_content()
+
+    def _build_krueger_method_content(self):
+        """Baut den Inhalt des Analyse-Krüger-Tabs für die aktuell in der
+        Methodenauswahl gewählte Methode neu auf."""
+        for widget in self._krueger_content_frame.winfo_children():
+            widget.destroy()
+
+        method_key = dict(KRUEGER_METHODS).get(
+            self._krueger_method_var.get(), KRUEGER_METHODS[0][1])
+        close_cmd = self._krueger_close_tab
+        content = self._krueger_content_frame
+
+        if method_key == "spot_zaehler":
+            SpotZaehlerDialog(content, self._active_datasets(), self._get_output_dir,
+                              lambda: self.bg_correction_var.get(), on_close=close_cmd)
+        elif method_key == "ics":
+            KruegerICSDialog(content, self._active_datasets(), self._get_output_dir,
+                             lambda: self.bg_correction_var.get(), on_close=close_cmd)
+        elif method_key == "simulation":
+            SpotSimulationDialog(content, self._get_output_dir, on_close=close_cmd)
+        elif method_key == "zstack":
+            ZStackDialog(content, self._get_output_dir, on_close=close_cmd)
 
     # ── App-Lifecycle ─────────────────────────────────────────────────────────
 
@@ -1406,7 +1547,7 @@ class ImageViewer:
         win.grab_set()
         tk.Label(win, text="Image Browser & Analysis Tool",
                  font=("Arial", 14, "bold")).pack(pady=(18, 4), padx=28)
-        tk.Label(win, text="Version 1.5.1",
+        tk.Label(win, text="Version 1.7.0",
                  font=("Arial", 10)).pack(pady=(0, 10))
         tk.Label(
             win,
@@ -1415,14 +1556,17 @@ class ImageViewer:
                 "Unterstützte Bildformate: .img (scanbin_s4), PNG, JPG, TIF, BMP, WEBP\n"
                 "Unterstützte Zeitreihendaten: HDF5 (.h5, .hdf5)\n\n"
                 "Oberfläche:\n"
-                "  • Alle Werkzeuge (Bildanalyse, Timetrace, Schichtdicke Zählen/ICS) "
+                "  • Alle Werkzeuge (Bildanalyse, Analyse-Kasprzak, Analyse-Krüger) "
                 "sind\n"
                 "    von Anfang an als Tabs im Hauptfenster vorhanden — kein "
                 "Auswahlbildschirm\n"
                 "    beim Start, kein separates Öffnen über ein Menü mehr nötig\n"
-                "  • Tabs einzeln schließbar, Schichtdicke-Tabs aktualisieren sich "
-                "automatisch\n"
-                "    nach jedem Neuladen von Bildern\n\n"
+                "  • Analyse-Kasprzak und Analyse-Krüger bündeln ihre jeweiligen "
+                "Methoden\n"
+                "    über eine Methodenauswahl im Tab statt eigener Einzel-Tabs\n"
+                "  • Tabs einzeln schließbar, aktualisieren sich automatisch nach "
+                "jedem\n"
+                "    Neuladen von Bildern\n\n"
                 "Bildbetrachter:\n"
                 "  • Grid-Ansicht mit konfigurierbaren Rows/Cols\n"
                 "  • Einzelkanal-Ansicht (detector0, detector1, sum)\n"
@@ -1437,29 +1581,47 @@ class ImageViewer:
                 "„Datei“-\n"
                 "    Abschnitt im rechten Seitenmenü\n\n"
                 "Analyse:\n"
-                "  • Timetrace – FCS Korrelationsanalyse:\n"
-                "      – Laden von HDF5-Photon-Daten via photon_tools\n"
-                "      – Logarithmisch gelagerte Korrelation mit pycorrelate\n"
-                "      – Modi: ch0×ch0, ch1×ch1, Kreuzkorrelation ch0×ch1\n"
-                "      – 3D-FCS-Fit (A₀, τ_D, S = ω_z/ω_xy) mit lmfit\n"
-                "      – 2-Panel-Plot: G(τ) + Fit oben, Residuen unten\n\n"
-                "  • Schichtdicke (Zählen):\n"
-                "      – Lokaler Threshold-Regler mit Live-Vorschau\n"
-                "      – Dickenberechnung aus Spot-Anzahl, Konzentration, Fläche\n"
-                "      – Verteilungsplot mit Mittelwert, ±1σ-Band, Fehlerbalken (an/aus)\n"
-                "      – CSV-Export der Ergebnisse\n\n"
-                "  • Schichtdicke (ICS, streng):\n"
-                "      – Image Correlation Spectroscopy (Petersen et al. 1993)\n"
-                "      – 2-D-Bild-ACF via FFT, mit Detrending gegen "
+                "  • Analyse-Kasprzak (Methodenauswahl im Tab):\n"
+                "      – Timetrace / FCS – FCS-Korrelationsanalyse:\n"
+                "          · Laden von HDF5-Photon-Daten via photon_tools\n"
+                "          · Logarithmisch gelagerte Korrelation mit pycorrelate\n"
+                "          · Modi: ch0×ch0, ch1×ch1, Kreuzkorrelation ch0×ch1\n"
+                "          · 3D-FCS-Fit (A₀, τ_D, S = ω_z/ω_xy) mit lmfit\n"
+                "          · 2-Panel-Plot: G(τ) + Fit oben, Residuen unten\n"
+                "      – Schichtdicke (Zählen):\n"
+                "          · Lokaler Threshold-Regler mit Live-Vorschau\n"
+                "          · Dickenberechnung aus Spot-Anzahl, Konzentration, "
+                "Fläche\n"
+                "          · Verteilungsplot mit Mittelwert, ±1σ-Band, "
+                "Fehlerbalken (an/aus)\n"
+                "          · CSV-Export der Ergebnisse\n"
+                "      – Schichtdicke (ICS, streng):\n"
+                "          · Image Correlation Spectroscopy (Petersen et al. "
+                "1993)\n"
+                "          · 2-D-Bild-ACF via FFT, mit Detrending gegen "
                 "Beleuchtungsinhomogenität\n"
-                "      – 2-D-Gauß-Fit (g0, w0, g_∞) mit Schrotrausch-Ausschluss\n"
-                "      – Formale Fehlerfortpflanzung UND empirische "
+                "          · 2-D-Gauß-Fit (g0, w0, g_∞) mit "
+                "Schrotrausch-Ausschluss\n"
+                "          · Formale Fehlerfortpflanzung UND empirische "
                 "Kachel-zu-Kachel-Streuung\n"
-                "      – Laufzeit-Plausibilitätsprüfungen (PSF-Abweichung, "
+                "          · Laufzeit-Plausibilitätsprüfungen (PSF-Abweichung, "
                 "Unterabtastung, u. a.)\n"
-                "      – 4-Panel-Plot, Report- und Plot-Export\n"
-                "      – Implementiert in ics_thickness.py (eigenständig testbar, "
-                "auch als CLI nutzbar)\n\n"
+                "          · 4-Panel-Plot, Report- und Plot-Export\n"
+                "          · Implementiert in ics_thickness.py (eigenständig "
+                "testbar, auch als CLI nutzbar)\n\n"
+                "  • Analyse-Krüger (Methodenauswahl im Tab, Willi_Analyse_Tool):\n"
+                "      – Spot-Zähler (Methode A): robuste Hintergrundschätzung +\n"
+                "        matched-filter-Glättung, 2D-Gauß-Fit pro Spot, automat.\n"
+                "        Doppelspot-Aufteilung, interaktive visuelle Prüfung\n"
+                "      – ICS-Auswertung (Methode B): Spotzahl aus der räumlichen\n"
+                "        Autokorrelation (2D-Gauß-Fit frei/fixiert), wählbare\n"
+                "        Untergrundschätzer, optionale cv-Korrektur\n"
+                "      – Spot-Simulation: synthetische .img-Testdaten mit\n"
+                "        bekannter Molekülzahl/-position (Ground Truth)\n"
+                "      – Z-Stack (PSF): Bead-Lokalisation + 2D-Gauß-Fit je Ebene,\n"
+                "        drift-korrigierter ROI-Stack, x-z/y-z-Schnitt, axiale\n"
+                "        PSF-Breite (FWHM_z) aus dem Zentralpixel-Profil\n"
+                "      – Je Methode CSV-/PNG-Export in den Ausgabeordner\n\n"
                 "Benötigte Pakete: numpy, pillow, matplotlib, scipy, photon_tools,\n"
                 "                  pycorrelate, lmfit"
             ),
@@ -1475,13 +1637,13 @@ class ImageViewer:
         win.resizable(False, False)
         win.grab_set()
 
-        w, h = 340, 210
+        w, h = 340, 300
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
         tk.Label(win, text="Image Browser & Analysis Tool",
                  font=("Arial", 13, "bold")).pack(pady=(24, 2))
-        tk.Label(win, text="Version 1.5.1",
+        tk.Label(win, text="Version 1.7.0",
                  font=("Arial", 10), fg="#555555").pack(pady=(0, 18))
 
         tk.Frame(win, height=1, bg="#cccccc").pack(fill="x", padx=30)
@@ -1494,6 +1656,13 @@ class ImageViewer:
                  font=("Arial", 10), fg="#555555").pack()
         tk.Label(win, text="Universität zu Lübeck",
                  font=("Arial", 10), fg="#555555").pack()
+
+        tk.Frame(win, height=1, bg="#cccccc").pack(fill="x", padx=30, pady=(16, 0))
+
+        tk.Label(win, text="Analyse-Krüger – Analyse-Methoden", font=("Arial", 9, "bold"),
+                 fg="#444444").pack(pady=(14, 2))
+        tk.Label(win, text="Wilhelm Krüger",
+                 font=("Arial", 11)).pack()
 
         tk.Button(win, text="Schließen", command=win.destroy,
                   width=12).pack(pady=(20, 16))

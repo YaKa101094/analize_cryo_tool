@@ -16,7 +16,7 @@ from pathlib import Path
 
 import tkinter as tk
 
-from image_processing import get_channel_array, unique_output_path
+from image_processing import get_channel_array, timestamped_filename, unique_output_path
 
 try:
     import ics_thickness as _ics
@@ -307,5 +307,6 @@ class ICSDialog:
         """Speichert den 4-Panel-Report als PNG in den Ausgabeordner."""
         if self._plot["fig"] is None:
             return
-        out_path = unique_output_path(self._get_output_dir(), "ics_report.png")
+        out_path = unique_output_path(
+            self._get_output_dir(), timestamped_filename("ics_report", "png"))
         self._plot["fig"].savefig(out_path, dpi=150, bbox_inches="tight")
