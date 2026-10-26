@@ -8,6 +8,8 @@ Autor: Yannik Kasprzak, Institut für Physik, Universität zu Lübeck
 """
 
 import os
+import struct
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
@@ -330,14 +332,215 @@ def count_spots(img: np.ndarray, threshold_fraction: float) -> int:
 
 # ── .img-Dateien einzeln laden (außerhalb der Hauptdatensatzliste) ────────────
 
+@dataclass
+class ImageMeta:
+    """Physical scan metadata (µm, seconds)."""
+    n_pixels_x: int
+    n_pixels_y: int
+    range_x_um: float
+    range_y_um: float
+    offset_x_um: float = 0.0
+    offset_y_um: float = 0.0
+    pixel_dwell_time_s: float | None = None
+
+    @property
+    def pixel_size_x_nm(self) -> float:
+        return self.range_x_um / self.n_pixels_x * 1000.0
+
+    @property
+    def pixel_size_y_nm(self) -> float:
+        return self.range_y_um / self.n_pixels_y * 1000.0
+
+
+def _scanbin_meta_from_header(header: bytes) -> ImageMeta | None:
+    """Liest die Scan-Metadaten aus den ersten 56 Bytes einer Messdatei
+    (Layout siehe parse_scanbin_img). Gibt None zurück, wenn der Header nicht
+    dem Messformat entspricht (z. B. ältere simulierte Dateien ohne Metadaten)."""
+    if len(header) < 56 or header[24:32] != header[48:56]:
+        return None
+    dwell_s, offset_x_m, offset_y_m = struct.unpack_from(">ddd", header, 0)
+    n_x, n_y = struct.unpack_from(">II", header, 24)
+    range_x_m, range_y_m = struct.unpack_from(">dd", header, 32)
+    if n_x <= 0 or n_y <= 0 or not (range_x_m > 0 and range_y_m > 0):
+        return None
+    return ImageMeta(
+        n_pixels_x=n_x, n_pixels_y=n_y,
+        range_x_um=range_x_m * 1e6, range_y_um=range_y_m * 1e6,
+        offset_x_um=offset_x_m * 1e6, offset_y_um=offset_y_m * 1e6,
+        pixel_dwell_time_s=dwell_s if dwell_s > 0 else None,
+    )
+
+
+def read_scanbin_meta(path: str) -> ImageMeta | None:
+    """Scan-Metadaten einer .img-Datei (None, wenn nicht lesbar oder nicht vorhanden)."""
+    try:
+        with open(path, "rb") as fobj:
+            return _scanbin_meta_from_header(fobj.read(56))
+    except OSError:
+        return None
+
+
+def parse_scanbin_img(path: str) -> dict:
+    """Liest eine scanbin_s4-.img-Datei ohne photon_tools.
+
+    Messdateien (big-endian):
+      Bytes  0–55 : Header
+        Offset  0 : Verweilzeit pro Pixel   (float64)
+        Offset 24 : Breite, Höhe            (2× uint32)
+        Offset 32 : Scanbereich X, Y [m]    (2× float64)
+        Offset 48 : Breite, Höhe (wiederholt)
+      ab Byte 56  : Kanäle als uint32-Bilder (Höhe × Breite), vor jedem
+                    weiteren Kanal ein 8-Byte-Marker (Breite, Höhe).
+                    Kanal 0 = Summe (transponiert gespeichert),
+                    Kanal 1 = detector0, Kanal 2 = detector1, Rest leer.
+
+    Älteres Format (von analysis_krueger_simulation.write_scanbin_img erzeugt):
+      88-Byte-Header mit Breite/Höhe bei Offset 24/28, danach uint16-Frames,
+      abwechselnd detector0 / detector1; alle Frames je Detektor werden summiert.
+
+    Der zurückgegebene Dict enthält zusätzlich "meta" (ImageMeta oder None).
+
+    Raises ValueError, wenn die Datei keinem der beiden Formate entspricht.
+    """
+    with open(path, "rb") as fobj:
+        data = fobj.read()
+    if len(data) <= 56:
+        raise ValueError(".img-Datei ist zu klein")
+
+    width = int.from_bytes(data[24:28], byteorder="big", signed=False)
+    height = int.from_bytes(data[28:32], byteorder="big", signed=False)
+    if width <= 0 or height <= 0:
+        raise ValueError("Ungültige Bilddimensionen im .img-Header")
+    n_pixels = width * height
+    name = os.path.basename(path)
+
+    # Messformat: 56 + k·(4·n) + (k−1)·8 Bytes, Marker zwischen den Kanälen
+    block = 4 * n_pixels + 8
+    n_channels, rest = divmod(len(data) - 56 + 8, block)
+    marker = data[24:32]
+    if (rest == 0 and n_channels >= 1
+            and all(data[56 + k * block - 8:56 + k * block] == marker
+                    for k in range(1, n_channels))):
+        channels = [np.frombuffer(data, dtype=">u4", count=n_pixels, offset=56 + k * block)
+                    .reshape(height, width).astype(np.float32)
+                    for k in range(n_channels)]
+        if n_channels >= 3:
+            detector0, detector1 = channels[1], channels[2]
+        else:
+            detector0 = channels[0]
+            detector1 = channels[1] if n_channels == 2 else np.zeros_like(detector0)
+        return {"path": path, "name": name,
+                "detector0": detector0, "detector1": detector1,
+                "sum": detector0 + detector1,
+                "meta": _scanbin_meta_from_header(data[:56])}
+
+    # Älteres uint16-Format
+    raw_u16 = np.frombuffer(data[88:], dtype=">u2")
+    total_values = (len(raw_u16) // n_pixels) * n_pixels
+    if total_values == 0:
+        raise ValueError("Keine vollständigen Frames in .img-Datei gefunden")
+    frames = raw_u16[:total_values].reshape(-1, height, width).astype(np.float32)
+    det0_frames = frames[0::2]
+    det1_frames = frames[1::2]
+    detector0 = det0_frames.sum(axis=0) if det0_frames.size else np.zeros((height, width), dtype=np.float32)
+    detector1 = det1_frames.sum(axis=0) if det1_frames.size else np.zeros((height, width), dtype=np.float32)
+    return {"path": path, "name": name,
+            "detector0": detector0, "detector1": detector1,
+            "sum": detector0 + detector1, "meta": None}
+
+
+def build_mosaic(datasets: list, channel: str = "sum", grid_um: float = 200.0,
+                 include_full_scans: bool = True,
+                 bg_correction: bool = False) -> dict | None:
+    """Setzt Bilder anhand ihrer Scan-Metadaten zu einem grid_um × grid_um-Mosaik zusammen.
+
+    Koordinaten: Der Scan-Offset eines Bildes ist dessen linke obere Ecke im
+    Grid (0 … grid_um, Mitte = grid_um / 2); x läuft nach rechts, y nach unten –
+    wie innerhalb eines Einzelbildes. Ein Vollscan (Offset 0/0, Scanbereich
+    grid_um) füllt das Grid also genau aus.
+
+    Auflösung: feinste Pixelgröße aller Bilder; gröbere Bilder (z. B. der
+    Vollscan) werden per Nearest-Neighbour hochskaliert. Bilder mit größerem
+    Scanbereich werden zuerst gezeichnet, damit kleine Kacheln oben liegen.
+
+    Parameters
+    ----------
+    datasets           : list  Datensätze (mit "meta"; Bilder ohne werden übersprungen)
+    channel            : str   "sum", "detector0" oder "detector1"
+    grid_um            : float Kantenlänge des Grids in µm
+    include_full_scans : bool  Bilder mit Scanbereich ≥ grid_um als Hintergrund einbeziehen
+    bg_correction      : bool  Hintergrundkorrektur je Einzelbild (siehe get_channel_array)
+
+    Returns
+    -------
+    None, wenn kein Bild platziert werden konnte, sonst dict mit
+      "image"      : float32-Array (n × n), leere Bereiche = 0
+      "covered"    : bool-Array (n × n), True wo ein Bild liegt
+      "px_um"      : Pixelgröße des Mosaiks in µm
+      "placements" : Liste (name, row0, col0, height, width) in Mosaik-Pixeln
+      "no_meta"    : Namen ohne Scan-Metadaten
+      "outside"    : Namen, die ganz außerhalb des Grids liegen
+      "duplicates" : Gruppen von Namen mit identischer Position und Größe
+    """
+    no_meta = [ds["name"] for ds in datasets if ds.get("meta") is None]
+    tiles = [ds for ds in datasets if ds.get("meta") is not None]
+    if not include_full_scans:
+        # Toleranz: Scanbereiche stehen als float64 in Metern in der Datei
+        # (z. B. 199.99999999999997 µm statt 200).
+        limit = grid_um * (1 - 1e-6)
+        tiles = [ds for ds in tiles
+                 if ds["meta"].range_x_um < limit or ds["meta"].range_y_um < limit]
+    if not tiles:
+        return None
+
+    px_um = min(min(ds["meta"].range_x_um / ds["meta"].n_pixels_x,
+                    ds["meta"].range_y_um / ds["meta"].n_pixels_y) for ds in tiles)
+    n = int(round(grid_um / px_um))
+    image = np.zeros((n, n), dtype=np.float32)
+    covered = np.zeros((n, n), dtype=bool)
+    placements, outside = [], []
+
+    by_position = {}
+    for ds in tiles:
+        m = ds["meta"]
+        key = tuple(round(v, 3) for v in (m.offset_x_um, m.offset_y_um, m.range_x_um, m.range_y_um))
+        by_position.setdefault(key, []).append(ds["name"])
+    duplicates = [names for names in by_position.values() if len(names) > 1]
+
+    for ds in sorted(tiles, key=lambda d: -(d["meta"].range_x_um * d["meta"].range_y_um)):
+        m = ds["meta"]
+        w = max(1, int(round(m.range_x_um / px_um)))
+        h = max(1, int(round(m.range_y_um / px_um)))
+        arr = get_channel_array(ds, channel, bg_correction=bg_correction).astype(np.float32)
+        if arr.shape != (h, w):
+            arr = np.asarray(Image.fromarray(arr, mode="F").resize(
+                (w, h), Image.Resampling.NEAREST), dtype=np.float32)
+        r0 = int(round(m.offset_y_um / px_um))
+        c0 = int(round(m.offset_x_um / px_um))
+        # Auf das Grid zuschneiden
+        rs, cs = max(r0, 0), max(c0, 0)
+        re, ce = min(r0 + h, n), min(c0 + w, n)
+        if rs >= re or cs >= ce:
+            outside.append(ds["name"])
+            continue
+        image[rs:re, cs:ce] = arr[rs - r0:re - r0, cs - c0:ce - c0]
+        covered[rs:re, cs:ce] = True
+        placements.append((ds["name"], r0, c0, h, w))
+
+    if not placements:
+        return None
+    return {"image": image, "covered": covered, "px_um": px_um,
+            "placements": placements, "no_meta": no_meta,
+            "outside": outside, "duplicates": duplicates}
+
+
 def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
     """Lädt eine einzelne .img-Datei unabhängig von den im Hauptfenster bereits
     geladenen Datensätzen (z. B. für Werkzeuge, die einen ganzen Ordner selbst
     durchsuchen, wie die Z-Stack-Analyse).
 
-    Versucht zuerst photon_tools (loader="scanbin_s4"), fällt sonst auf den
-    byteweisen scanbin_s4-Fallback-Parser zurück (siehe
-    ImageViewer.open_custom_img für die identische Formatbeschreibung).
+    Versucht zuerst photon_tools (loader="scanbin_s4"), fällt sonst auf
+    parse_scanbin_img zurück.
 
     Returns
     -------
@@ -355,37 +558,12 @@ def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
             det0 = np.asarray(ds.channels["detector0"], dtype=np.float32)
             det1 = np.asarray(ds.channels["detector1"], dtype=np.float32)
             return {"path": path, "name": os.path.basename(path),
-                    "detector0": det0, "detector1": det1, "sum": det0 + det1}
+                    "detector0": det0, "detector1": det1, "sum": det0 + det1,
+                    "meta": read_scanbin_meta(path)}
         except Exception:
             pass
 
     try:
-        with open(path, "rb") as fobj:
-            data = fobj.read()
-        if len(data) <= 88:
-            return None
-
-        header = data[:88]
-        payload = data[88:]
-        width = int.from_bytes(header[24:28], byteorder="big", signed=False)
-        height = int.from_bytes(header[28:32], byteorder="big", signed=False)
-        if width <= 0 or height <= 0:
-            return None
-
-        raw_u16 = np.frombuffer(payload, dtype=">u2")
-        pixels_per_frame = width * height
-        total_values = (len(raw_u16) // pixels_per_frame) * pixels_per_frame
-        if total_values == 0:
-            return None
-
-        n_frames = total_values // pixels_per_frame
-        frames = raw_u16[:total_values].reshape(n_frames, height, width).astype(np.float32)
-        det0_frames = frames[0::2]
-        det1_frames = frames[1::2]
-        detector0 = det0_frames.sum(axis=0) if det0_frames.size else np.zeros((height, width), dtype=np.float32)
-        detector1 = det1_frames.sum(axis=0) if det1_frames.size else np.zeros((height, width), dtype=np.float32)
-        return {"path": path, "name": os.path.basename(path),
-                "detector0": detector0, "detector1": detector1,
-                "sum": detector0 + detector1}
+        return parse_scanbin_img(path)
     except Exception:
         return None

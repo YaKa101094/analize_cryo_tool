@@ -1,0 +1,12 @@
+# Pakete fuer Schichtdicke.py
+# pycorrelate fehlt hier absichtlich: es laesst sich nicht direkt per pip
+# installieren und wird von install_pycorrelate.py eingerichtet (setup.bat).
+
+numpy
+pillow
+matplotlib
+scipy
+lmfit
+h5py
+tifffile
+numba

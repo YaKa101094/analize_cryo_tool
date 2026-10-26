@@ -261,6 +261,8 @@ class ImageViewer:
         tk.Checkbutton(frm_anzeige, text="Hintergrundkorrektur",
                        variable=self.bg_correction_var,
                        command=self.update_display).pack(anchor="w")
+        tk.Button(frm_anzeige, text="Mosaik 200 × 200 µm",
+                  command=self.show_mosaic_viewer).pack(fill="x", pady=(6, 0))
 
         # Abschnitt: Bildauswahl
         frm_sel = tk.LabelFrame(right_panel, text="Bildauswahl",
@@ -282,8 +284,9 @@ class ImageViewer:
                        variable=self.save_names_var).pack(anchor="w")
         tk.Checkbutton(frm_save, text="Rasterbild",
                        variable=self.save_raster_var).pack(anchor="w")
-        tk.Checkbutton(frm_save, text="   Dateinamen statt Nummern",
-                       variable=self.grid_filenames_var).pack(anchor="w", pady=(0, 6))
+        tk.Checkbutton(frm_save, text="Dateinamen statt Nummern",
+                       variable=self.grid_filenames_var,
+                       wraplength=115, justify="left").pack(anchor="w", padx=(16, 0), pady=(0, 6))
         tk.Button(frm_save, text="Bilder speichern",
                   command=self.save_images_png).pack(fill="x", pady=(0, 6))
         tk.Button(frm_save, text="Output öffnen",
@@ -424,7 +427,8 @@ class ImageViewer:
                         det1 = np.asarray(ds.channels["detector1"], dtype=np.float32)
                         return {"path": path, "name": os.path.basename(path),
                                 "detector0": det0, "detector1": det1,
-                                "sum": det0 + det1}
+                                "sum": det0 + det1,
+                                "meta": _ip.read_scanbin_meta(path)}
                     except Exception:
                         pass
                 return self.open_custom_img(path)
@@ -438,51 +442,9 @@ class ImageViewer:
             return None
 
     def open_custom_img(self, path):
-        """Liest eine scanbin_s4-.img-Datei ohne photon_tools (Fallback-Parser).
-
-        Binärformat (big-endian):
-          Bytes   0–87 : Header
-            Offset 24–27 : Bildbreite  (uint32, big-endian)
-            Offset 28–31 : Bildhöhe   (uint32, big-endian)
-          Bytes  88–   : Pixeldaten als uint16, Frame-interleaved:
-                          Frame 0 (det0), Frame 1 (det1), Frame 2 (det0), …
-
-        Alle Frames eines Detektors werden aufsummiert (Integriert).
-        """
-        with open(path, "rb") as fobj:
-            data = fobj.read()
-        if len(data) <= 88:
-            raise ValueError(".img-Datei ist zu klein")
-
-        header  = data[:88]
-        payload = data[88:]
-        width   = int.from_bytes(header[24:28], byteorder="big", signed=False)
-        height  = int.from_bytes(header[28:32], byteorder="big", signed=False)
-
-        if width <= 0 or height <= 0:
-            raise ValueError("Ungültige Bilddimensionen im .img-Header")
-
-        raw_u16 = np.frombuffer(payload, dtype=">u2")
-        pixels_per_frame = width * height
-        # Auf ganze Frames kürzen
-        total_values = (len(raw_u16) // pixels_per_frame) * pixels_per_frame
-        if total_values == 0:
-            raise ValueError("Keine vollständigen Frames in .img-Datei gefunden")
-
-        n_frames = total_values // pixels_per_frame
-        frames   = raw_u16[:total_values].reshape(n_frames, height, width).astype(np.float32)
-
-        # Gerade Frames → detector0, ungerade → detector1
-        det0_frames = frames[0::2]
-        det1_frames = frames[1::2]
-        detector0 = (det0_frames.sum(axis=0) if det0_frames.size
-                     else np.zeros((height, width), dtype=np.float32))
-        detector1 = (det1_frames.sum(axis=0) if det1_frames.size
-                     else np.zeros((height, width), dtype=np.float32))
-
-        return {"path": path, "name": os.path.basename(path),
-                "detector0": detector0, "detector1": detector1,
-                "sum": detector0 + detector1}
+        """Liest eine scanbin_s4-.img-Datei ohne photon_tools (Fallback-Parser,
+        Formatbeschreibung siehe image_processing.parse_scanbin_img)."""
+        return _ip.parse_scanbin_img(path)
 
     # ── Canvas-Helfer ─────────────────────────────────────────────────────────
 
@@ -974,6 +936,23 @@ class ImageViewer:
             f"Bildgröße:  {w} x {h} px",
             f"Datentyp:   {image_array.dtype}",
             "",
+        ]
+
+        meta = dataset.get("meta") if dataset is not None else None
+        if meta is not None:
+            lines += [
+                f"Pixel:      {meta.n_pixels_x} x {meta.n_pixels_y}",
+                f"Scanbereich: {meta.range_x_um:g} x {meta.range_y_um:g} µm",
+                f"Pixelgröße: {meta.pixel_size_x_nm:g} x {meta.pixel_size_y_nm:g} nm",
+                f"Offset:     ({meta.offset_x_um:g}, {meta.offset_y_um:g}) µm",
+            ]
+            if meta.pixel_dwell_time_s is not None:
+                lines.append(f"Verweilzeit: {meta.pixel_dwell_time_s * 1e3:g} ms/Pixel")
+            lines.append("")
+        else:
+            lines += ["Scan-Metadaten: nicht vorhanden", ""]
+
+        lines += [
             f"Min:        {float(np.nanmin(image_array)):.2f}",
             f"Max:        {float(np.nanmax(image_array)):.2f}",
             f"Mittelwert: {float(np.nanmean(image_array)):.2f}",
@@ -995,6 +974,219 @@ class ImageViewer:
 
         tk.Button(win, text="Schließen", command=win.destroy,
                   width=12).pack(pady=(0, 14))
+
+    def show_mosaic_viewer(self, grid_um=200.0):
+        """Setzt die aktiven Bilder anhand ihrer Scan-Offsets zu einem
+        grid_um × grid_um-Mosaik zusammen (siehe ip.build_mosaic) und zeigt es
+        zoombar an. Achsen in µm, Kachelrahmen optional; "Bild speichern"
+        exportiert das Mosaik in voller Auflösung samt Achsen und Farbskala."""
+        datasets = self._active_datasets()
+        if not datasets:
+            self.status_label.config(text="Keine Bilder geladen.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Mosaik {grid_um:g} × {grid_um:g} µm")
+        win.state("zoomed")
+
+        channel_var = tk.StringVar(value=(self.display_mode_var.get()
+                                          if self.display_mode_var.get() in ("detector0", "detector1")
+                                          else "sum"))
+        full_var = tk.BooleanVar(value=True)
+        frames_var = tk.BooleanVar(value=True)
+
+        top = tk.Frame(win)
+        top.pack(fill="x", padx=10, pady=(8, 2))
+        tk.Label(top, text="Kanal:").pack(side="left")
+        channel_combo = ttk.Combobox(top, state="readonly", width=10, textvariable=channel_var,
+                                     values=["sum", "detector0", "detector1"])
+        channel_combo.pack(side="left", padx=(4, 12))
+        tk.Checkbutton(top, text="Vollscans als Hintergrund",
+                       variable=full_var).pack(side="left", padx=6)
+        tk.Checkbutton(top, text="Kachelrahmen",
+                       variable=frames_var).pack(side="left", padx=6)
+        info_label = tk.Label(win, font=("Arial", 9), justify="left", anchor="w")
+        info_label.pack(fill="x", padx=10)
+        warn_label = tk.Label(win, font=("Arial", 9), fg="#b05000", justify="left",
+                              anchor="w", wraplength=1400)
+        warn_label.pack(fill="x", padx=10)
+
+        content = tk.Frame(win)
+        content.pack(fill="both", expand=True, padx=6, pady=2)
+        canvas_frame = tk.Frame(content)
+        canvas_frame.pack(side="left", fill="both", expand=True)
+        sb_y = tk.Scrollbar(canvas_frame, orient="vertical")
+        sb_x = tk.Scrollbar(canvas_frame, orient="horizontal")
+        canvas = tk.Canvas(canvas_frame, bg="#1a1a1a", highlightthickness=0,
+                           yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        sb_y.config(command=canvas.yview)
+        sb_x.config(command=canvas.xview)
+        sb_y.pack(side="right", fill="y")
+        sb_x.pack(side="bottom", fill="x")
+        canvas.pack(side="left", fill="both", expand=True)
+        scale_holder = tk.Frame(content)
+        scale_holder.pack(side="left", fill="y")
+
+        try:
+            fnt = ImageFont.truetype("arial.ttf", 11)
+        except Exception:
+            fnt = ImageFont.load_default()
+        margin_l, margin_t, margin_rb = 44, 22, 20   # Rand für Achsenbeschriftung
+        state = {"zoom": 1.0, "photo": None, "mosaic": None, "color": None}
+
+        def compose(zoom):
+            """Mosaik bei *zoom* (Display-Pixel je Mosaik-Pixel) inkl. Achsen und Rahmen."""
+            mos, color = state["mosaic"], state["color"]
+            n = mos["image"].shape[0]
+            size = max(1, int(round(n * zoom)))
+            img = color.resize((size, size), Image.Resampling.NEAREST)
+            out = Image.new("RGB", (size + margin_l + margin_rb, size + margin_t + margin_rb),
+                            (26, 26, 26))
+            out.paste(img, (margin_l, margin_t))
+            draw = ImageDraw.Draw(out)
+            s = size / grid_um   # Display-Pixel je µm
+            if frames_var.get():
+                for _name, r0, c0, h, w in mos["placements"]:
+                    x0, y0 = margin_l + c0 * zoom, margin_t + r0 * zoom
+                    draw.rectangle([x0, y0, x0 + w * zoom - 1, y0 + h * zoom - 1],
+                                   outline=(120, 180, 255))
+            step = 20 if s * 20 >= 28 else 50
+            for um in range(0, int(grid_um) + 1, step):
+                p = um * s
+                draw.line([margin_l + p, margin_t - 4, margin_l + p, margin_t], fill=(200, 200, 200))
+                draw.line([margin_l - 4, margin_t + p, margin_l, margin_t + p], fill=(200, 200, 200))
+                draw.text((margin_l + p - 8, 4), str(um), fill=(220, 220, 200), font=fnt)
+                draw.text((4, margin_t + p - 7), str(um), fill=(220, 220, 200), font=fnt)
+            draw.rectangle([margin_l - 1, margin_t - 1, margin_l + size, margin_t + size],
+                           outline=(200, 200, 200))
+            return out
+
+        def redraw():
+            if state["mosaic"] is None:
+                canvas.delete("all")
+                return
+            img = compose(state["zoom"])
+            photo = ImageTk.PhotoImage(img)
+            state["photo"] = photo   # GC-Schutz
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=photo)
+            canvas.configure(scrollregion=(0, 0, img.width, img.height))
+
+        def rebuild(_event=None):
+            ch = channel_var.get()
+            mos = _ip.build_mosaic(datasets, ch, grid_um=grid_um,
+                                   include_full_scans=full_var.get(),
+                                   bg_correction=self.bg_correction_var.get())
+            state["mosaic"] = mos
+            for w in scale_holder.winfo_children():
+                w.destroy()
+            if mos is None:
+                info_label.config(text="Keine Bilder mit Scan-Metadaten im Grid – nichts anzuzeigen.")
+                warn_label.config(text="")
+                redraw()
+                return
+            color = self._to_color_image(mos["image"], ch)
+            # Nicht abgedeckte Bereiche grau statt schwarz, damit sie sich von
+            # Intensität 0 unterscheiden.
+            rgb = np.asarray(color).copy()
+            rgb[~mos["covered"]] = (60, 60, 60)
+            state["color"] = Image.fromarray(rgb, mode="RGB")
+            d_min, d_max = self._display_range(mos["image"][mos["covered"]])
+            state["disp_min"], state["disp_max"] = d_min, d_max
+            self._add_intensity_scale(scale_holder, d_min, d_max, height=400, channel=ch)
+
+            n = mos["image"].shape[0]
+            info_label.config(text=(
+                f"{len(mos['placements'])} Bilder platziert  |  Mosaik {n} × {n} px, "
+                f"{mos['px_um'] * 1000:g} nm/px  |  Achsen in µm, Offset = linke obere Ecke  |  "
+                "Klick auf ein Bild: Metadaten"))
+            warnings = []
+            if mos["duplicates"]:
+                warnings.append(
+                    f"{len(mos['duplicates'])} Positionen sind mehrfach belegt (z. B. "
+                    f"{' / '.join(mos['duplicates'][0])}) – vermutlich mehrere Proben. "
+                    "Über „Bildauswahl“ nur die Bilder einer Probe auswählen.")
+            if mos["no_meta"]:
+                warnings.append(f"{len(mos['no_meta'])} Bilder ohne Scan-Metadaten übersprungen.")
+            if mos["outside"]:
+                warnings.append(f"{len(mos['outside'])} Bilder liegen außerhalb des Grids.")
+            warn_label.config(text="\n".join(warnings))
+
+            cw, chh = canvas.winfo_width(), canvas.winfo_height()
+            if cw > 1 and chh > 1:
+                state["zoom"] = min((cw - margin_l - margin_rb) / n, (chh - margin_t - margin_rb) / n)
+            redraw()
+
+        def on_mousewheel(event):
+            if state["mosaic"] is None:
+                return
+            n = state["mosaic"]["image"].shape[0]
+            cx, cy = canvas.canvasx(event.x), canvas.canvasy(event.y)
+            old = state["zoom"]
+            factor = 1.15 if event.delta > 0 else 1 / 1.15
+            # Obergrenze ~8000 px Kantenlänge, damit das Rendern flüssig bleibt
+            state["zoom"] = max(0.05, min(8000 / n, old * factor))
+            redraw()
+            ratio = state["zoom"] / old
+            w_total = n * state["zoom"] + margin_l + margin_rb
+            h_total = n * state["zoom"] + margin_t + margin_rb
+            canvas.xview_moveto((cx * ratio - event.x) / w_total)
+            canvas.yview_moveto((cy * ratio - event.y) / h_total)
+
+        canvas.bind("<MouseWheel>", on_mousewheel)
+
+        def on_canvas_click(event):
+            """Öffnet die Metadaten des angeklickten Bildes (oberste Kachel an der Stelle)."""
+            mos = state["mosaic"]
+            if mos is None:
+                return
+            col = (canvas.canvasx(event.x) - margin_l) / state["zoom"]
+            row = (canvas.canvasy(event.y) - margin_t) / state["zoom"]
+            # placements liegt in Zeichenreihenfolge vor – zuletzt gezeichnet = oben
+            for name, r0, c0, h, w in reversed(mos["placements"]):
+                if r0 <= row < r0 + h and c0 <= col < c0 + w:
+                    ds = next(d for d in datasets if d["name"] == name)
+                    ch = channel_var.get()
+                    self._show_metadata(ds, self._get_channel_image(ds, ch), ch, name)
+                    return
+
+        canvas.bind("<Button-1>", on_canvas_click)
+
+        def save_mosaic():
+            if state["mosaic"] is None:
+                return
+            ch = channel_var.get()
+            img = compose(1.0)   # volle Mosaik-Auflösung
+            title = f"Mosaik {grid_um:g}x{grid_um:g} um | {ch}"
+            header_h = 22 if self.save_names_var.get() else 0
+            cbar = _ip.make_colorbar_pil(state["disp_min"], state["disp_max"],
+                                         img.height - margin_t - margin_rb, ch)
+            out = Image.new("RGB", (img.width + cbar.width, img.height + header_h), (26, 26, 26))
+            out.paste(img, (0, header_h))
+            out.paste(cbar, (img.width, header_h + margin_t - 14))
+            if header_h:
+                ImageDraw.Draw(out).text((4, 4), title, fill=(255, 255, 200), font=fnt)
+            path = _ip.unique_output_path(
+                self._get_output_dir(), _ip.timestamped_filename(f"mosaik_{int(grid_um)}um_{ch}", "png"))
+            out.save(path)
+            orig = win.title()
+            win.title(f"{orig} — gespeichert: {os.path.basename(path)}")
+            win.after(3000, lambda: win.title(orig))
+
+        channel_combo.bind("<<ComboboxSelected>>", rebuild)
+        full_var.trace_add("write", lambda *_: rebuild())
+        frames_var.trace_add("write", lambda *_: redraw())
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=(4, 10))
+        tk.Button(btn_frame, text="Bild speichern", command=save_mosaic,
+                  width=14).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="Output öffnen", command=self._open_output_folder,
+                  width=14).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="Schließen", command=win.destroy,
+                  width=12).pack(side="left", padx=6)
+
+        win.after(50, rebuild)
 
     def _refresh_main_view(self):
         """Baut die aktuell sichtbare Grid-/Mehrkanalansicht neu auf, ohne

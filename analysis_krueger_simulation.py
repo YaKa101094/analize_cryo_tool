@@ -100,11 +100,11 @@ def save_spot_positions_csv(info, path, pixel_size_x_um, pixel_size_y_um):
 
 
 def write_scanbin_img(path, detector1, detector2):
-    """Schreibt ein .img im scanbin_s4-Fallback-Format des ImageViewers (88-Byte-
-    Header mit Breite/Höhe bei Offset 24/28, danach uint16-Bilddaten,
-    Frame-interleaved: Frame 0 = Detektor1, Frame 1 = Detektor2). Kompatibel
-    mit ImageViewer.open_custom_img, damit erzeugte Testbilder direkt über
-    "Bilder laden" nutzbar sind."""
+    """Schreibt ein .img im älteren uint16-Format (88-Byte-Header mit
+    Breite/Höhe bei Offset 24/28, danach uint16-Bilddaten, Frame 0 = Detektor1,
+    Frame 1 = Detektor2). image_processing.parse_scanbin_img liest es neben dem
+    Messformat weiterhin, damit erzeugte Testbilder direkt über "Bilder laden"
+    nutzbar sind."""
     ny, nx = detector1.shape
     header = bytearray(88)
     header[24:28] = int(nx).to_bytes(4, byteorder="big", signed=False)

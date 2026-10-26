@@ -6,16 +6,15 @@ Tkinter-basiertes Desktop-Tool zum Laden, Visualisieren und Analysieren von Fluo
 
 ---
 
-## Voraussetzungen
+## Installation (Windows)
 
-- Python ≥ 3.9
-- Erforderlich:
+1. Python 3.11, 3.12 oder 3.13 installieren – z. B. von [python.org](https://www.python.org/downloads/) oder in einer Konsole mit `py install 3.12`. Neuere Versionen (3.14+) werden noch nicht von allen Paketen unterstützt.
+2. **`setup.bat`** per Doppelklick ausführen. Es legt die virtuelle Umgebung `.venv` an und installiert alle Pakete aus `requirements.txt` sowie `pycorrelate` (über `install_pycorrelate.py`, das einen Kompatibilitätsfehler des PyPI-Pakets behebt). Dafür ist einmalig eine Internetverbindung nötig.
+3. Das Programm danach mit **`start.bat`** starten.
 
-```
-pip install numpy pillow
-```
+`setup.bat` muss auf jedem PC einmal ausgeführt werden – die `.venv` ist an den Rechner gebunden, auf dem sie erstellt wurde, und lässt sich nicht mitkopieren.
 
-- Optional, je nach genutzter Analyse:
+### Pakete
 
 | Paket | Wird gebraucht für |
 |---|---|
@@ -29,8 +28,10 @@ pip install numpy pillow
 
 ## Starten
 
+Doppelklick auf `start.bat`, oder in einer Konsole:
+
 ```bash
-python Schichtdicke.py
+.venv\Scripts\python.exe Schichtdicke.py
 ```
 
 Beim Start sucht das Programm automatisch nach einem Unterordner `img/` im selben Verzeichnis und lädt alle dort gefundenen Bilder.
