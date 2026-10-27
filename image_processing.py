@@ -8,6 +8,8 @@ Autor: Yannik Kasprzak, Institut für Physik, Universität zu Lübeck
 """
 
 import os
+import struct
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
@@ -79,6 +81,123 @@ def timestamped_filename(base_name: str, ext: str) -> str:
     ts = datetime.now().strftime("%d_%m_%Y_%H-%M-%S")
     ext = ext.lstrip(".")
     return f"{base_name}_{ts}.{ext}"
+
+
+# ── .img-Header (scanbin_s4) ──────────────────────────────────────────────────
+
+IMG_HEADER_SIZE = 88
+
+# Byte-Offsets im 88-Byte-Header, alle big-endian. Abgeleitet und gegen die
+# Referenzwerte von photon_tools verifiziert (tests/data/img/
+# img_FCS_80uW_Alexa488_150pM_012.img -> dwelltime 1 ms, offset 130 µm,
+# range 10 µm, 150x150 px). Längen/Zeiten stehen in SI-Einheiten, also
+# Meter und Sekunden.
+_IMG_HEADER_LAYOUT_F64 = {
+    "dwelltime": 0,
+    "offset_x": 8,
+    "offset_y": 16,
+    "range_x": 32,
+    "range_y": 40,
+}
+_IMG_HEADER_LAYOUT_U32 = {
+    "pixel_x": 24,
+    "pixel_y": 28,
+}
+
+
+@dataclass
+class ImageMeta:
+    """Physikalische Aufnahmeparameter eines scanbin_s4-Scans.
+
+    Feldnamen und Einheiten entsprechen der ImageMeta von photon_tools, damit
+    beide Quellen (natives Laden und Fallback-Parser) austauschbar sind.
+    """
+
+    n_pixels_x: int
+    n_pixels_y: int
+    range_x_um: float
+    range_y_um: float
+    offset_x_um: float
+    offset_y_um: float
+    pixel_dwell_time_s: float
+
+    @property
+    def pixel_size_x_um(self) -> float:
+        """Kantenlänge eines Pixels in x-Richtung [µm]."""
+        return self.range_x_um / self.n_pixels_x
+
+    @property
+    def pixel_size_y_um(self) -> float:
+        """Kantenlänge eines Pixels in y-Richtung [µm]."""
+        return self.range_y_um / self.n_pixels_y
+
+    @property
+    def frame_time_s(self) -> float:
+        """Reine Pixel-Verweilzeit eines kompletten Frames [s] (ohne Overhead)."""
+        return self.pixel_dwell_time_s * self.n_pixels_x * self.n_pixels_y
+
+
+def parse_img_header(raw: bytes) -> dict:
+    """Zerlegt die ersten 88 Bytes einer .img-Datei in ein Feld-Dict.
+
+    Parameters
+    ----------
+    raw : bytes  Mindestens IMG_HEADER_SIZE Bytes vom Dateianfang.
+
+    Returns
+    -------
+    dict  Schlüssel "dwelltime", "offset_x", "offset_y", "range_x", "range_y"
+          (float, SI: Sekunden bzw. Meter) sowie "pixel_x", "pixel_y" (int).
+    """
+    if len(raw) < IMG_HEADER_SIZE:
+        raise ValueError(".img-Header ist zu kurz")
+
+    header = {name: struct.unpack_from(">d", raw, off)[0]
+              for name, off in _IMG_HEADER_LAYOUT_F64.items()}
+    header.update({name: int.from_bytes(raw[off:off + 4], "big", signed=False)
+                   for name, off in _IMG_HEADER_LAYOUT_U32.items()})
+    if header["pixel_x"] <= 0 or header["pixel_y"] <= 0:
+        raise ValueError("Ungültige Bilddimensionen im .img-Header")
+    return header
+
+
+def img_meta_from_header(header: dict) -> ImageMeta:
+    """Rechnet ein Header-Dict in ImageMeta um (SI -> Pixel, µm, Sekunden)."""
+    return ImageMeta(
+        n_pixels_x=int(header["pixel_x"]),
+        n_pixels_y=int(header["pixel_y"]),
+        range_x_um=float(header["range_x"]) * 1e6,
+        range_y_um=float(header["range_y"]) * 1e6,
+        offset_x_um=float(header["offset_x"]) * 1e6,
+        offset_y_um=float(header["offset_y"]) * 1e6,
+        pixel_dwell_time_s=float(header["dwelltime"]),
+    )
+
+
+def img_frame_count(path: str, meta: ImageMeta) -> int | None:
+    """Zahl der Frames in einer .img-Datei, beide Detektoren zusammengezählt.
+
+    Ergibt sich aus der Dateigröße: nach dem Header folgen uint16-Pixel, also
+    2 Byte pro Pixel. Unvollständige Frames am Ende werden abgeschnitten.
+    """
+    try:
+        payload = os.path.getsize(path) - IMG_HEADER_SIZE
+    except OSError:
+        return None
+    return payload // 2 // (meta.n_pixels_x * meta.n_pixels_y)
+
+
+def read_img_meta(path: str) -> ImageMeta | None:
+    """Liest nur den Header einer .img-Datei und gibt die Metadaten zurück.
+
+    Returns None, wenn die Datei keine lesbare scanbin_s4-Datei ist — der
+    Aufrufer zeigt die Metadaten dann einfach nicht an.
+    """
+    try:
+        with open(path, "rb") as fobj:
+            return img_meta_from_header(parse_img_header(fobj.read(IMG_HEADER_SIZE)))
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
 
 
 # ── Kanal-Hilfsfunktion ───────────────────────────────────────────────────────
@@ -342,7 +461,8 @@ def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
     Returns
     -------
     dict mit "path", "name", "detector0", "detector1", "sum" (alle 2D-float32-
-    Arrays), oder None wenn die Datei nicht lesbar ist.
+    Arrays) sowie "meta" (ImageMeta oder None), oder None wenn die Datei nicht
+    lesbar ist.
     """
     try:
         import photon_tools as _pt
@@ -354,23 +474,25 @@ def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
             ds = _pt.load_image(path, loader=loader_name)
             det0 = np.asarray(ds.channels["detector0"], dtype=np.float32)
             det1 = np.asarray(ds.channels["detector1"], dtype=np.float32)
+            meta = read_img_meta(path)
             return {"path": path, "name": os.path.basename(path),
-                    "detector0": det0, "detector1": det1, "sum": det0 + det1}
+                    "detector0": det0, "detector1": det1, "sum": det0 + det1,
+                    "meta": meta,
+                    "n_frames": (img_frame_count(path, meta)
+                                 if meta is not None else None)}
         except Exception:
             pass
 
     try:
         with open(path, "rb") as fobj:
             data = fobj.read()
-        if len(data) <= 88:
+        if len(data) <= IMG_HEADER_SIZE:
             return None
 
-        header = data[:88]
-        payload = data[88:]
-        width = int.from_bytes(header[24:28], byteorder="big", signed=False)
-        height = int.from_bytes(header[28:32], byteorder="big", signed=False)
-        if width <= 0 or height <= 0:
-            return None
+        header_fields = parse_img_header(data[:IMG_HEADER_SIZE])
+        payload = data[IMG_HEADER_SIZE:]
+        width = header_fields["pixel_x"]
+        height = header_fields["pixel_y"]
 
         raw_u16 = np.frombuffer(payload, dtype=">u2")
         pixels_per_frame = width * height
@@ -386,6 +508,8 @@ def load_img_dataset(path: str, loader_name: str = "scanbin_s4") -> dict | None:
         detector1 = det1_frames.sum(axis=0) if det1_frames.size else np.zeros((height, width), dtype=np.float32)
         return {"path": path, "name": os.path.basename(path),
                 "detector0": detector0, "detector1": detector1,
-                "sum": detector0 + detector1}
+                "sum": detector0 + detector1,
+                "meta": img_meta_from_header(header_fields),
+                "n_frames": n_frames}
     except Exception:
         return None

@@ -282,8 +282,9 @@ class ImageViewer:
                        variable=self.save_names_var).pack(anchor="w")
         tk.Checkbutton(frm_save, text="Rasterbild",
                        variable=self.save_raster_var).pack(anchor="w")
-        tk.Checkbutton(frm_save, text="   Dateinamen statt Nummern",
-                       variable=self.grid_filenames_var).pack(anchor="w", pady=(0, 6))
+        tk.Checkbutton(frm_save, text="Dateinamen statt Nummern",
+                       variable=self.grid_filenames_var,
+                       wraplength=115, justify="left").pack(anchor="w", padx=(16, 0), pady=(0, 6))
         tk.Button(frm_save, text="Bilder speichern",
                   command=self.save_images_png).pack(fill="x", pady=(0, 6))
         tk.Button(frm_save, text="Output öffnen",
@@ -422,9 +423,18 @@ class ImageViewer:
                         ds = pt.load_image(path, loader=self._img_loader_name)
                         det0 = np.asarray(ds.channels["detector0"], dtype=np.float32)
                         det1 = np.asarray(ds.channels["detector1"], dtype=np.float32)
+                        # Der Header wird immer selbst gelesen statt ds.meta zu
+                        # übernehmen: photon_tools-Versionen liefern dort
+                        # unterschiedliche ImageMeta-Klassen, deren abgeleitete
+                        # Werte sich unterscheiden (0.1.1 hat z. B. kein
+                        # frame_time_s). Die Felder sind bitgleich zu unserem
+                        # Parser, siehe image_processing.parse_img_header.
+                        meta = _ip.read_img_meta(path)
                         return {"path": path, "name": os.path.basename(path),
                                 "detector0": det0, "detector1": det1,
-                                "sum": det0 + det1}
+                                "sum": det0 + det1, "meta": meta,
+                                "n_frames": (_ip.img_frame_count(path, meta)
+                                             if meta is not None else None)}
                     except Exception:
                         pass
                 return self.open_custom_img(path)
@@ -441,9 +451,9 @@ class ImageViewer:
         """Liest eine scanbin_s4-.img-Datei ohne photon_tools (Fallback-Parser).
 
         Binärformat (big-endian):
-          Bytes   0–87 : Header
-            Offset 24–27 : Bildbreite  (uint32, big-endian)
-            Offset 28–31 : Bildhöhe   (uint32, big-endian)
+          Bytes   0–87 : Header mit Scanparametern — Aufteilung der Felder
+                          siehe image_processing.parse_img_header; Bildbreite
+                          und -höhe stehen auf Offset 24–27 bzw. 28–31.
           Bytes  88–   : Pixeldaten als uint16, Frame-interleaved:
                           Frame 0 (det0), Frame 1 (det1), Frame 2 (det0), …
 
@@ -451,16 +461,13 @@ class ImageViewer:
         """
         with open(path, "rb") as fobj:
             data = fobj.read()
-        if len(data) <= 88:
+        if len(data) <= _ip.IMG_HEADER_SIZE:
             raise ValueError(".img-Datei ist zu klein")
 
-        header  = data[:88]
-        payload = data[88:]
-        width   = int.from_bytes(header[24:28], byteorder="big", signed=False)
-        height  = int.from_bytes(header[28:32], byteorder="big", signed=False)
-
-        if width <= 0 or height <= 0:
-            raise ValueError("Ungültige Bilddimensionen im .img-Header")
+        header_fields = _ip.parse_img_header(data[:_ip.IMG_HEADER_SIZE])
+        payload = data[_ip.IMG_HEADER_SIZE:]
+        width   = header_fields["pixel_x"]
+        height  = header_fields["pixel_y"]
 
         raw_u16 = np.frombuffer(payload, dtype=">u2")
         pixels_per_frame = width * height
@@ -482,7 +489,9 @@ class ImageViewer:
 
         return {"path": path, "name": os.path.basename(path),
                 "detector0": detector0, "detector1": detector1,
-                "sum": detector0 + detector1}
+                "sum": detector0 + detector1,
+                "meta": _ip.img_meta_from_header(header_fields),
+                "n_frames": n_frames}
 
     # ── Canvas-Helfer ─────────────────────────────────────────────────────────
 
@@ -933,7 +942,8 @@ class ImageViewer:
         tk.Button(
             btn_frame, text="Metadaten", width=12,
             command=lambda: self._show_metadata(
-                state["dataset"], state["image_array"], channel, state["title_text"]),
+                state["dataset"], state["image_array"], channel, state["title_text"],
+                parent=win),
         ).pack(side="left", padx=6)
         tk.Button(btn_frame, text="Schließen", command=win.destroy,
                   width=12).pack(side="left", padx=6)
@@ -950,8 +960,13 @@ class ImageViewer:
 
         win.after(50, init_view)
 
-    def _show_metadata(self, dataset, image_array, channel, title_text):
-        """Zeigt Datei- und Bildkennwerte des aktuell im Zoom-Viewer offenen Bildes."""
+    def _show_metadata(self, dataset, image_array, channel, title_text, parent=None):
+        """Zeigt Datei- und Bildkennwerte des aktuell im Zoom-Viewer offenen Bildes.
+
+        *parent* ist das aufrufende Fenster. Es wird als Master gesetzt, weil
+        der Zoom-Viewer maximiert läuft ("zoomed") — ohne transient()/lift()
+        erscheint dieses Fenster dahinter und wirkt wie ein toter Button.
+        """
         lines = [f"Titel:      {title_text}"]
         if dataset is not None:
             lines.append(f"Datei:      {dataset.get('name', '–')}")
@@ -966,6 +981,24 @@ class ImageViewer:
                         f"{datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}")
                 except OSError:
                     pass
+
+        meta = dataset.get("meta") if dataset is not None else None
+        if meta is not None:
+            n_frames = dataset.get("n_frames")
+            lines += [
+                "",
+                "── Aufnahmeparameter (.img-Header) ──",
+                f"{'Pixel:':<13}{meta.n_pixels_x} x {meta.n_pixels_y}",
+                f"{'Scanbereich:':<13}{meta.range_x_um:.2f} x {meta.range_y_um:.2f} µm",
+                f"{'Pixelgröße:':<13}{meta.pixel_size_x_um * 1000:.1f} x "
+                f"{meta.pixel_size_y_um * 1000:.1f} nm",
+                f"{'Offset:':<13}{meta.offset_x_um:.1f}, {meta.offset_y_um:.1f} µm",
+                f"{'Verweilzeit:':<13}{meta.pixel_dwell_time_s * 1e3:.3f} ms/Pixel",
+                f"{'Frame-Zeit:':<13}{meta.frame_time_s:.3f} s",
+            ]
+            if n_frames:
+                lines.append(f"{'Frames:':<13}{n_frames} "
+                             f"(det0: {(n_frames + 1) // 2}, det1: {n_frames // 2})")
 
         h, w = image_array.shape
         lines += [
@@ -983,9 +1016,11 @@ class ImageViewer:
             f"Spots:      {self._count_spots(image_array, self.threshold_value, dataset=dataset)}",
         ]
 
-        win = tk.Toplevel(self.root)
+        master = parent if parent is not None else self.root
+        win = tk.Toplevel(master)
         win.title("Metadaten")
         win.resizable(False, False)
+        win.transient(master)
 
         text = tk.Text(win, width=46, height=len(lines) + 1,
                        font=("Courier", 10))
@@ -995,6 +1030,13 @@ class ImageViewer:
 
         tk.Button(win, text="Schließen", command=win.destroy,
                   width=12).pack(pady=(0, 14))
+
+        win.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - win.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.lift()
+        win.focus_set()
 
     def _refresh_main_view(self):
         """Baut die aktuell sichtbare Grid-/Mehrkanalansicht neu auf, ohne
